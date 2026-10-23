@@ -9,7 +9,7 @@ from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HOST = os.environ.get("HOST", "127.0.0.1")
+HOST = os.environ.get("HOST", "0.0.0.0")
 PORTA = int(os.environ.get("PORT", "8000"))
 BANCO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnpj_finder.db")
 MAX_GERACAO = 500
