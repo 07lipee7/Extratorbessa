@@ -14,15 +14,7 @@ PORTA = int(os.environ.get("PORT", "8000"))
 BANCO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnpj_finder.db")
 MAX_GERACAO = 500
 
-# ------------------------------------------------------------ RENDA / DDD
-# O programa procura automaticamente, na tabela "empresas", uma coluna de renda
-# e uma de porte. Se a sua coluna tiver outro nome, defina a variável de
-# ambiente RENDA_COLUNA (ex.: RENDA_COLUNA=capital_social_empresa).
-RENDA_CANDIDATAS = ["renda", "faturamento", "capital_social", "capital"]
-PORTE_CANDIDATAS = ["porte", "porte_empresa"]
-if os.environ.get("RENDA_COLUNA"):
-    RENDA_CANDIDATAS.insert(0, os.environ["RENDA_COLUNA"].strip().lower())
-
+# ------------------------------------------------------------ DDD
 # Telefone sem símbolos, para extrair o DDD direto no SQL.
 _TEL_LIMPO = (
     "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE("
@@ -52,36 +44,6 @@ def normalizar_ddd(valor):
     """Retorna só os 2 dígitos do DDD, ou '' se for inválido/vazio."""
     digitos = "".join(ch for ch in str(valor or "") if ch.isdigit())
     return digitos[-2:] if len(digitos) >= 2 else ""
-
-
-def formatar_renda(valor):
-    if valor is None or str(valor).strip() == "":
-        return "—"
-    texto = str(valor).strip()
-    try:
-        if "," in texto:
-            texto = texto.replace(".", "").replace(",", ".")
-        numero = float(texto)
-    except ValueError:
-        return texto
-    bruto = f"{numero:,.2f}"
-    return "R$ " + bruto.replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def campos_extras(con):
-    """Descobre as colunas de renda e porte existentes na tabela empresas."""
-    colunas = {
-        linha["name"].lower(): linha["name"]
-        for linha in con.execute("PRAGMA table_info(empresas)")
-    }
-
-    def achar(candidatas):
-        for nome in candidatas:
-            if nome in colunas:
-                return f'e."{colunas[nome]}"'
-        return "NULL"
-
-    return achar(RENDA_CANDIDATAS), achar(PORTE_CANDIDATAS)
 
 
 def tem_coluna_ramo(con):
@@ -239,11 +201,12 @@ def contar_geradas():
         con.close()
 
 
-def buscar_empresas(termo, ddd="", ramo=""):
+def buscar_empresas(termo, ddd="", ramo="", quantidade=100):
     """Busca empresas ainda não usadas (por texto e/ou DDD) e registra os resultados."""
     termo = termo.strip()
     ddd = normalizar_ddd(ddd)
     ramo = ramo.strip()
+    quantidade = max(1, min(int(quantidade), MAX_GERACAO))
     if not termo and not ddd and not ramo:
         return []
 
@@ -259,7 +222,6 @@ def buscar_empresas(termo, ddd="", ramo=""):
 
     con = conectar()
     try:
-        renda, porte = campos_extras(con)
         if ramo:
             if not tem_coluna_ramo(con):
                 raise ValueError("Rode o classificar_ramos.py antes de filtrar por ramo.")
@@ -268,8 +230,7 @@ def buscar_empresas(termo, ddd="", ramo=""):
         ramo_sql = "e.ramo" if tem_coluna_ramo(con) else "NULL"
         con.execute("BEGIN IMMEDIATE")
         resultados = con.execute(f"""
-            SELECT e.cnpj, e.nome, e.telefone,
-                   {renda} AS renda, {porte} AS porte, {ramo_sql} AS ramo
+            SELECT e.cnpj, e.nome, e.telefone, {ramo_sql} AS ramo
             FROM empresas e
             WHERE {' AND '.join(filtros)}
               AND e.cnpj IS NOT NULL
@@ -280,8 +241,8 @@ def buscar_empresas(termo, ddd="", ramo=""):
                   WHERE g.cnpj = e.cnpj
               )
             ORDER BY e.nome
-            LIMIT 200
-        """, params).fetchall()
+            LIMIT ?
+        """, params + [quantidade]).fetchall()
 
         # Registra todos os resultados mostrados para que não apareçam
         # novamente em buscas futuras nem na geração aleatória.
@@ -313,7 +274,6 @@ def gerar_empresas(quantidade, ddd="", ramo=""):
 
     con = conectar()
     try:
-        renda, porte = campos_extras(con)
         filtro_ramo = ""
         if ramo:
             if not tem_coluna_ramo(con):
@@ -324,8 +284,7 @@ def gerar_empresas(quantidade, ddd="", ramo=""):
         ramo_sql = "e.ramo" if tem_coluna_ramo(con) else "NULL"
         con.execute("BEGIN IMMEDIATE")
         resultados = con.execute(f"""
-            SELECT e.cnpj, e.nome, e.telefone,
-                   {renda} AS renda, {porte} AS porte, {ramo_sql} AS ramo
+            SELECT e.cnpj, e.nome, e.telefone, {ramo_sql} AS ramo
             FROM empresas e
             WHERE e.cnpj IS NOT NULL
               AND TRIM(e.cnpj) != ''
@@ -376,8 +335,6 @@ def tabela_empresas(empresas):
             <td>{escapar(empresa['nome'])}</td>
             <td>{escapar(empresa['telefone'])}</td>
             <td>{escapar(extrair_ddd(empresa['telefone']) or '—')}</td>
-            <td>{escapar(formatar_renda(empresa['renda']))}</td>
-            <td>{escapar(empresa['porte'] or '—')}</td>
             <td>{escapar(empresa['ramo'] or '—')}</td>
         </tr>
         """)
@@ -387,7 +344,7 @@ def tabela_empresas(empresas):
         <table>
             <thead>
                 <tr><th>CNPJ</th><th>Nome fantasia</th><th>Telefone</th>
-                <th>DDD</th><th>Renda</th><th>Porte</th><th>Ramo</th></tr>
+                <th>DDD</th><th>Ramo</th></tr>
             </thead>
             <tbody>{''.join(linhas)}</tbody>
         </table>
@@ -576,6 +533,14 @@ tr:last-child td {{ border-bottom: 0; }}
         <select id="ramo_busca" name="ramo">
           <option value="">Todos</option>{opcoes_ramo}
         </select>
+        <label for="quantidade_busca">Quantidade de empresas</label>
+        <select id="quantidade_busca" name="quantidade">
+          <option value="10">10 empresas</option>
+          <option value="50">50 empresas</option>
+          <option value="100" selected>100 empresas</option>
+          <option value="250">250 empresas</option>
+          <option value="500">500 empresas</option>
+        </select>
         <button type="submit">Buscar</button>
       </form>
     </div>
@@ -708,7 +673,12 @@ class CNPJHandler(BaseHTTPRequestHandler):
                 termo = parametros.get("q", [""])[0][:120]
                 ddd = normalizar_ddd(parametros.get("ddd", [""])[0][:5])
                 ramo = parametros.get("ramo", [""])[0][:80]
-                resultados = buscar_empresas(termo, ddd, ramo)
+                try:
+                    quantidade = int(parametros.get("quantidade", ["100"])[0])
+                except ValueError:
+                    quantidade = 100
+                quantidade = max(1, min(quantidade, MAX_GERACAO))
+                resultados = buscar_empresas(termo, ddd, ramo, quantidade)
                 filtros_txt = []
                 if termo:
                     filtros_txt.append(f"termo: <strong>{escapar(termo)}</strong>")
@@ -718,6 +688,7 @@ class CNPJHandler(BaseHTTPRequestHandler):
                     filtros_txt.append(f"ramo: <strong>{escapar(ramo)}</strong>")
                 conteudo = (
                     f"<p>Filtros: {' | '.join(filtros_txt) or 'nenhum'}. "
+                    f"Quantidade solicitada: {quantidade}. "
                     f"Resultados exibidos e registrados: {len(resultados)}.</p>"
                     + tabela_empresas(resultados)
                 )
@@ -726,10 +697,8 @@ class CNPJHandler(BaseHTTPRequestHandler):
             elif url.path == "/historico":
                 con = conectar()
                 try:
-                    renda, porte = campos_extras(con)
                     historico = con.execute(f"""
                         SELECT e.cnpj, e.nome, e.telefone,
-                               {renda} AS renda, {porte} AS porte,
                                g.cnpj AS cnpj_usado, g.data_geracao
                         FROM empresas_geradas g
                         LEFT JOIN empresas e ON e.cnpj = g.cnpj
@@ -748,16 +717,13 @@ class CNPJHandler(BaseHTTPRequestHandler):
                             <td>{escapar(item['nome'])}</td>
                             <td>{escapar(item['telefone'])}</td>
                             <td>{escapar(extrair_ddd(item['telefone']) or '—')}</td>
-                            <td>{escapar(formatar_renda(item['renda']))}</td>
-                            <td>{escapar(item['porte'] or '—')}</td>
                             <td>{escapar(item['data_geracao'])}</td>
                         </tr>
                         """)
                     conteudo = f"""
                     <div class="tabela-wrap"><table>
                     <thead><tr><th>CNPJ</th><th>Nome fantasia</th>
-                    <th>Telefone</th><th>DDD</th><th>Renda</th><th>Porte</th>
-                    <th>Data de utilização</th></tr></thead>
+                    <th>Telefone</th><th>DDD</th><th>Data de utilização</th></tr></thead>
                     <tbody>{''.join(linhas)}</tbody></table></div>
                     """
                 else:
