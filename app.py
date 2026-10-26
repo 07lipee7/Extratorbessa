@@ -84,6 +84,24 @@ def campos_extras(con):
     return achar(RENDA_CANDIDATAS), achar(PORTE_CANDIDATAS)
 
 
+def tem_coluna_ramo(con):
+    return any(l["name"].lower() == "ramo"
+               for l in con.execute("PRAGMA table_info(empresas)"))
+
+
+def listar_ramos():
+    """Lê a lista de ramos criada pelo classificar_ramos.py."""
+    con = conectar()
+    try:
+        return con.execute(
+            "SELECT ramo, total FROM ramos_disponiveis ORDER BY ramo"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
 # ---------------------------------------------------------------- AUTENTICAÇÃO
 # Defina SECRET_KEY como variável de ambiente na hospedagem (texto longo e
 # aleatório). Se não definir, uma chave temporária é criada a cada execução
@@ -221,11 +239,12 @@ def contar_geradas():
         con.close()
 
 
-def buscar_empresas(termo, ddd=""):
+def buscar_empresas(termo, ddd="", ramo=""):
     """Busca empresas ainda não usadas (por texto e/ou DDD) e registra os resultados."""
     termo = termo.strip()
     ddd = normalizar_ddd(ddd)
-    if not termo and not ddd:
+    ramo = ramo.strip()
+    if not termo and not ddd and not ramo:
         return []
 
     filtros = []
@@ -241,10 +260,16 @@ def buscar_empresas(termo, ddd=""):
     con = conectar()
     try:
         renda, porte = campos_extras(con)
+        if ramo:
+            if not tem_coluna_ramo(con):
+                raise ValueError("Rode o classificar_ramos.py antes de filtrar por ramo.")
+            filtros.append("e.ramo = ?")
+            params.append(ramo)
+        ramo_sql = "e.ramo" if tem_coluna_ramo(con) else "NULL"
         con.execute("BEGIN IMMEDIATE")
         resultados = con.execute(f"""
             SELECT e.cnpj, e.nome, e.telefone,
-                   {renda} AS renda, {porte} AS porte
+                   {renda} AS renda, {porte} AS porte, {ramo_sql} AS ramo
             FROM empresas e
             WHERE {' AND '.join(filtros)}
               AND e.cnpj IS NOT NULL
@@ -274,7 +299,7 @@ def buscar_empresas(termo, ddd=""):
         con.close()
 
 
-def gerar_empresas(quantidade, ddd=""):
+def gerar_empresas(quantidade, ddd="", ramo=""):
     """Seleciona CNPJs aleatórios ainda não usados (opcionalmente de um DDD)."""
     quantidade = max(1, min(int(quantidade), MAX_GERACAO))
     ddd = normalizar_ddd(ddd)
@@ -284,19 +309,28 @@ def gerar_empresas(quantidade, ddd=""):
     if ddd:
         filtro_ddd = f"AND {SQL_DDD} = ?"
         params.append(ddd)
-    params.append(quantidade)
+    ramo = ramo.strip()
 
     con = conectar()
     try:
         renda, porte = campos_extras(con)
+        filtro_ramo = ""
+        if ramo:
+            if not tem_coluna_ramo(con):
+                raise ValueError("Rode o classificar_ramos.py antes de filtrar por ramo.")
+            filtro_ramo = "AND e.ramo = ?"
+            params.append(ramo)
+        params.append(quantidade)
+        ramo_sql = "e.ramo" if tem_coluna_ramo(con) else "NULL"
         con.execute("BEGIN IMMEDIATE")
         resultados = con.execute(f"""
             SELECT e.cnpj, e.nome, e.telefone,
-                   {renda} AS renda, {porte} AS porte
+                   {renda} AS renda, {porte} AS porte, {ramo_sql} AS ramo
             FROM empresas e
             WHERE e.cnpj IS NOT NULL
               AND TRIM(e.cnpj) != ''
               {filtro_ddd}
+              {filtro_ramo}
               AND NOT EXISTS (
                   SELECT 1
                   FROM empresas_geradas g
@@ -344,6 +378,7 @@ def tabela_empresas(empresas):
             <td>{escapar(extrair_ddd(empresa['telefone']) or '—')}</td>
             <td>{escapar(formatar_renda(empresa['renda']))}</td>
             <td>{escapar(empresa['porte'] or '—')}</td>
+            <td>{escapar(empresa['ramo'] or '—')}</td>
         </tr>
         """)
 
@@ -352,7 +387,7 @@ def tabela_empresas(empresas):
         <table>
             <thead>
                 <tr><th>CNPJ</th><th>Nome fantasia</th><th>Telefone</th>
-                <th>DDD</th><th>Renda</th><th>Porte</th></tr>
+                <th>DDD</th><th>Renda</th><th>Porte</th><th>Ramo</th></tr>
             </thead>
             <tbody>{''.join(linhas)}</tbody>
         </table>
@@ -421,6 +456,10 @@ a {{ color: var(--azul); }}
 def pagina(conteudo="", titulo="CNPJ Finder", aviso="", usuario=""):
     disponiveis = contar_disponiveis()
     usados = contar_geradas()
+    opcoes_ramo = "".join(
+        f'<option value="{escapar(r["ramo"])}">{escapar(r["ramo"])} ({r["total"]:,})</option>'
+        for r in listar_ramos()
+    )
     aviso_html = f'<div class="aviso">{escapar(aviso)}</div>' if aviso else ""
     sair_html = (
         f'<a href="/logout">Sair ({escapar(usuario)})</a>' if usuario else ""
@@ -533,6 +572,10 @@ tr:last-child td {{ border-bottom: 0; }}
         <label for="ddd_busca">DDD (opcional)</label>
         <input id="ddd_busca" name="ddd" type="text" inputmode="numeric"
                maxlength="3" placeholder="Ex.: 11">
+        <label for="ramo_busca">Ramo (opcional)</label>
+        <select id="ramo_busca" name="ramo">
+          <option value="">Todos</option>{opcoes_ramo}
+        </select>
         <button type="submit">Buscar</button>
       </form>
     </div>
@@ -552,6 +595,10 @@ tr:last-child td {{ border-bottom: 0; }}
         <label for="ddd_gerar">DDD (opcional, vazio = todos)</label>
         <input id="ddd_gerar" name="ddd" type="text" inputmode="numeric"
                maxlength="3" placeholder="Ex.: 11">
+        <label for="ramo_gerar">Ramo (opcional)</label>
+        <select id="ramo_gerar" name="ramo">
+          <option value="">Todos</option>{opcoes_ramo}
+        </select>
         <button type="submit">Gerar empresas</button>
       </form>
     </div>
@@ -660,12 +707,15 @@ class CNPJHandler(BaseHTTPRequestHandler):
                 parametros = parse_qs(url.query)
                 termo = parametros.get("q", [""])[0][:120]
                 ddd = normalizar_ddd(parametros.get("ddd", [""])[0][:5])
-                resultados = buscar_empresas(termo, ddd)
+                ramo = parametros.get("ramo", [""])[0][:80]
+                resultados = buscar_empresas(termo, ddd, ramo)
                 filtros_txt = []
                 if termo:
                     filtros_txt.append(f"termo: <strong>{escapar(termo)}</strong>")
                 if ddd:
                     filtros_txt.append(f"DDD: <strong>{escapar(ddd)}</strong>")
+                if ramo:
+                    filtros_txt.append(f"ramo: <strong>{escapar(ramo)}</strong>")
                 conteudo = (
                     f"<p>Filtros: {' | '.join(filtros_txt) or 'nenhum'}. "
                     f"Resultados exibidos e registrados: {len(resultados)}.</p>"
@@ -767,9 +817,11 @@ class CNPJHandler(BaseHTTPRequestHandler):
                 quantidade = 10
             quantidade = max(1, min(quantidade, MAX_GERACAO))
             ddd = normalizar_ddd(parametros.get("ddd", [""])[0][:5])
+            ramo = parametros.get("ramo", [""])[0][:80]
 
-            resultados = gerar_empresas(quantidade, ddd)
-            ddd_txt = f" (DDD {escapar(ddd)})" if ddd else ""
+            resultados = gerar_empresas(quantidade, ddd, ramo)
+            ddd_txt = (f" (DDD {escapar(ddd)})" if ddd else "") + \
+                      (f" (ramo {escapar(ramo)})" if ramo else "")
             conteudo = (
                 f"<p>Solicitadas: {quantidade}{ddd_txt}. "
                 f"Empresas encontradas e registradas: {len(resultados)}.</p>"
