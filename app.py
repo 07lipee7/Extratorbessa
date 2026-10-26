@@ -14,6 +14,76 @@ PORTA = int(os.environ.get("PORT", "8000"))
 BANCO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnpj_finder.db")
 MAX_GERACAO = 500
 
+# ------------------------------------------------------------ RENDA / DDD
+# O programa procura automaticamente, na tabela "empresas", uma coluna de renda
+# e uma de porte. Se a sua coluna tiver outro nome, defina a variável de
+# ambiente RENDA_COLUNA (ex.: RENDA_COLUNA=capital_social_empresa).
+RENDA_CANDIDATAS = ["renda", "faturamento", "capital_social", "capital"]
+PORTE_CANDIDATAS = ["porte", "porte_empresa"]
+if os.environ.get("RENDA_COLUNA"):
+    RENDA_CANDIDATAS.insert(0, os.environ["RENDA_COLUNA"].strip().lower())
+
+# Telefone sem símbolos, para extrair o DDD direto no SQL.
+_TEL_LIMPO = (
+    "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE("
+    "COALESCE(e.telefone,''),'(',''),')',''),' ',''),'-',''),'+',''),'.','')"
+)
+# Trata "+55 11 ...", "011 ..." e "11 ...".
+SQL_DDD = (
+    f"(CASE "
+    f"WHEN {_TEL_LIMPO} LIKE '55%' AND LENGTH({_TEL_LIMPO}) >= 12 "
+    f"THEN SUBSTR({_TEL_LIMPO},3,2) "
+    f"WHEN {_TEL_LIMPO} LIKE '0%' THEN SUBSTR({_TEL_LIMPO},2,2) "
+    f"ELSE SUBSTR({_TEL_LIMPO},1,2) END)"
+)
+
+
+def extrair_ddd(telefone):
+    """Mesma regra do SQL_DDD, para mostrar o DDD na tabela."""
+    n = "".join(ch for ch in str(telefone or "") if ch.isdigit())
+    if n.startswith("55") and len(n) >= 12:
+        return n[2:4]
+    if n.startswith("0"):
+        return n[1:3]
+    return n[:2]
+
+
+def normalizar_ddd(valor):
+    """Retorna só os 2 dígitos do DDD, ou '' se for inválido/vazio."""
+    digitos = "".join(ch for ch in str(valor or "") if ch.isdigit())
+    return digitos[-2:] if len(digitos) >= 2 else ""
+
+
+def formatar_renda(valor):
+    if valor is None or str(valor).strip() == "":
+        return "—"
+    texto = str(valor).strip()
+    try:
+        if "," in texto:
+            texto = texto.replace(".", "").replace(",", ".")
+        numero = float(texto)
+    except ValueError:
+        return texto
+    bruto = f"{numero:,.2f}"
+    return "R$ " + bruto.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def campos_extras(con):
+    """Descobre as colunas de renda e porte existentes na tabela empresas."""
+    colunas = {
+        linha["name"].lower(): linha["name"]
+        for linha in con.execute("PRAGMA table_info(empresas)")
+    }
+
+    def achar(candidatas):
+        for nome in candidatas:
+            if nome in colunas:
+                return f'e."{colunas[nome]}"'
+        return "NULL"
+
+    return achar(RENDA_CANDIDATAS), achar(PORTE_CANDIDATAS)
+
+
 # ---------------------------------------------------------------- AUTENTICAÇÃO
 # Defina SECRET_KEY como variável de ambiente na hospedagem (texto longo e
 # aleatório). Se não definir, uma chave temporária é criada a cada execução
@@ -151,24 +221,32 @@ def contar_geradas():
         con.close()
 
 
-def buscar_empresas(termo):
-    """Busca empresas ainda não usadas e registra os resultados exibidos."""
+def buscar_empresas(termo, ddd=""):
+    """Busca empresas ainda não usadas (por texto e/ou DDD) e registra os resultados."""
     termo = termo.strip()
-    if not termo:
+    ddd = normalizar_ddd(ddd)
+    if not termo and not ddd:
         return []
 
-    padrao = f"%{termo}%"
+    filtros = []
+    params = []
+    if termo:
+        filtros.append("(e.nome LIKE ? OR e.cnpj LIKE ? OR e.telefone LIKE ?)")
+        padrao = f"%{termo}%"
+        params += [padrao, padrao, padrao]
+    if ddd:
+        filtros.append(f"{SQL_DDD} = ?")
+        params.append(ddd)
+
     con = conectar()
     try:
+        renda, porte = campos_extras(con)
         con.execute("BEGIN IMMEDIATE")
-        resultados = con.execute("""
-            SELECT e.cnpj, e.nome, e.telefone
+        resultados = con.execute(f"""
+            SELECT e.cnpj, e.nome, e.telefone,
+                   {renda} AS renda, {porte} AS porte
             FROM empresas e
-            WHERE (
-                e.nome LIKE ?
-                OR e.cnpj LIKE ?
-                OR e.telefone LIKE ?
-            )
+            WHERE {' AND '.join(filtros)}
               AND e.cnpj IS NOT NULL
               AND TRIM(e.cnpj) != ''
               AND NOT EXISTS (
@@ -178,7 +256,7 @@ def buscar_empresas(termo):
               )
             ORDER BY e.nome
             LIMIT 200
-        """, (padrao, padrao, padrao)).fetchall()
+        """, params).fetchall()
 
         # Registra todos os resultados mostrados para que não apareçam
         # novamente em buscas futuras nem na geração aleatória.
@@ -187,7 +265,6 @@ def buscar_empresas(termo):
                 INSERT OR IGNORE INTO empresas_geradas (cnpj)
                 VALUES (?)
             """, [(empresa["cnpj"],) for empresa in resultados])
-
         con.commit()
         return resultados
     except Exception:
@@ -197,17 +274,29 @@ def buscar_empresas(termo):
         con.close()
 
 
-def gerar_empresas(quantidade):
-    """Seleciona CNPJs aleatórios ainda não usados, sem repetir."""
+def gerar_empresas(quantidade, ddd=""):
+    """Seleciona CNPJs aleatórios ainda não usados (opcionalmente de um DDD)."""
     quantidade = max(1, min(int(quantidade), MAX_GERACAO))
+    ddd = normalizar_ddd(ddd)
+
+    filtro_ddd = ""
+    params = []
+    if ddd:
+        filtro_ddd = f"AND {SQL_DDD} = ?"
+        params.append(ddd)
+    params.append(quantidade)
+
     con = conectar()
     try:
+        renda, porte = campos_extras(con)
         con.execute("BEGIN IMMEDIATE")
-        resultados = con.execute("""
-            SELECT e.cnpj, e.nome, e.telefone
+        resultados = con.execute(f"""
+            SELECT e.cnpj, e.nome, e.telefone,
+                   {renda} AS renda, {porte} AS porte
             FROM empresas e
             WHERE e.cnpj IS NOT NULL
               AND TRIM(e.cnpj) != ''
+              {filtro_ddd}
               AND NOT EXISTS (
                   SELECT 1
                   FROM empresas_geradas g
@@ -215,14 +304,13 @@ def gerar_empresas(quantidade):
               )
             ORDER BY RANDOM()
             LIMIT ?
-        """, (quantidade,)).fetchall()
+        """, params).fetchall()
 
         if resultados:
             con.executemany("""
                 INSERT OR IGNORE INTO empresas_geradas (cnpj)
                 VALUES (?)
             """, [(empresa["cnpj"],) for empresa in resultados])
-
         con.commit()
         return resultados
     except Exception:
@@ -240,31 +328,35 @@ def escapar(valor):
 def tabela_empresas(empresas):
     if not empresas:
         return """
-            <div class="vazio">
-                Nenhuma empresa disponível encontrada.
-                Talvez os resultados já tenham sido usados.
-            </div>
+        <div class="vazio">
+            Nenhuma empresa disponível encontrada.
+            Talvez os resultados já tenham sido usados.
+        </div>
         """
 
     linhas = []
     for empresa in empresas:
         linhas.append(f"""
-            <tr>
-                <td>{escapar(empresa['cnpj'])}</td>
-                <td>{escapar(empresa['nome'])}</td>
-                <td>{escapar(empresa['telefone'])}</td>
-            </tr>
+        <tr>
+            <td>{escapar(empresa['cnpj'])}</td>
+            <td>{escapar(empresa['nome'])}</td>
+            <td>{escapar(empresa['telefone'])}</td>
+            <td>{escapar(extrair_ddd(empresa['telefone']) or '—')}</td>
+            <td>{escapar(formatar_renda(empresa['renda']))}</td>
+            <td>{escapar(empresa['porte'] or '—')}</td>
+        </tr>
         """)
 
     return f"""
-        <div class="tabela-wrap">
-          <table>
+    <div class="tabela-wrap">
+        <table>
             <thead>
-              <tr><th>CNPJ</th><th>Nome fantasia</th><th>Telefone</th></tr>
+                <tr><th>CNPJ</th><th>Nome fantasia</th><th>Telefone</th>
+                <th>DDD</th><th>Renda</th><th>Porte</th></tr>
             </thead>
             <tbody>{''.join(linhas)}</tbody>
-          </table>
-        </div>
+        </table>
+    </div>
     """
 
 
@@ -333,7 +425,6 @@ def pagina(conteudo="", titulo="CNPJ Finder", aviso="", usuario=""):
     sair_html = (
         f'<a href="/logout">Sair ({escapar(usuario)})</a>' if usuario else ""
     )
-
     return f"""<!doctype html>
 <html lang="pt-BR">
 <head>
@@ -396,7 +487,7 @@ button:hover, .botao:hover {{ filter: brightness(1.08); }}
 }}
 .resultados {{ margin-top: 24px; }}
 .tabela-wrap {{ overflow-x: auto; border: 1px solid var(--borda); border-radius: 10px; }}
-table {{ width: 100%; border-collapse: collapse; min-width: 620px; }}
+table {{ width: 100%; border-collapse: collapse; min-width: 820px; }}
 th, td {{ text-align: left; padding: 12px; border-bottom: 1px solid var(--borda); }}
 th {{ background: #1a2940; }}
 tr:last-child td {{ border-bottom: 0; }}
@@ -413,68 +504,74 @@ tr:last-child td {{ border-bottom: 0; }}
 </head>
 <body>
 <main>
-<header>
-  <h1>Extrator Bessa</h1>
-  <p class="subtitulo">Pesquisa local e seleção aleatória de empresas da sua base SQLite.</p>
-</header>
+  <header>
+    <h1>Extrator Bessa</h1>
+    <p class="subtitulo">Pesquisa local e seleção aleatória de empresas da sua base SQLite.</p>
+  </header>
 
-{aviso_html}
+  {aviso_html}
 
-<section class="stats">
-  <div class="card">
-    <div class="stat-label">CNPJs disponíveis</div>
-    <div class="stat-numero">{disponiveis:,}</div>
-  </div>
-  <div class="card">
-    <div class="stat-label">CNPJs já utilizados</div>
-    <div class="stat-numero">{usados:,}</div>
-  </div>
-</section>
+  <section class="stats">
+    <div class="card">
+      <div class="stat-label">CNPJs disponíveis</div>
+      <div class="stat-numero">{disponiveis:,}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">CNPJs já utilizados</div>
+      <div class="stat-numero">{usados:,}</div>
+    </div>
+  </section>
 
-<section class="paineis">
-  <div class="painel">
-    <h2>Buscar empresas</h2>
-    <p class="subtitulo">Os resultados exibidos ficam registrados e não voltam a aparecer.</p>
-    <form method="get" action="/buscar">
-      <label for="q">Nome, CNPJ ou telefone</label>
-      <input id="q" name="q" type="text" maxlength="120" required
-             placeholder="Ex.: nome da empresa ou número">
-      <button type="submit">Buscar</button>
-    </form>
-  </div>
+  <section class="paineis">
+    <div class="painel">
+      <h2>Buscar empresas</h2>
+      <p class="subtitulo">Os resultados exibidos ficam registrados e não voltam a aparecer.</p>
+      <form method="get" action="/buscar">
+        <label for="q">Nome, CNPJ ou telefone (opcional se informar o DDD)</label>
+        <input id="q" name="q" type="text" maxlength="120"
+               placeholder="Ex.: nome da empresa ou número">
+        <label for="ddd_busca">DDD (opcional)</label>
+        <input id="ddd_busca" name="ddd" type="text" inputmode="numeric"
+               maxlength="3" placeholder="Ex.: 11">
+        <button type="submit">Buscar</button>
+      </form>
+    </div>
 
-  <div class="painel">
-    <h2>Gerar CNPJs aleatórios</h2>
-    <p class="subtitulo">Cada CNPJ é usado uma única vez entre buscas e gerações.</p>
-    <form method="post" action="/gerar">
-      <label for="quantidade">Quantidade</label>
-      <select id="quantidade" name="quantidade">
-        <option value="10">10 empresas</option>
-        <option value="50">50 empresas</option>
-        <option value="100">100 empresas</option>
-        <option value="250">250 empresas</option>
-        <option value="500">500 empresas</option>
-      </select>
-      <button type="submit">Gerar empresas</button>
-    </form>
-  </div>
-</section>
+    <div class="painel">
+      <h2>Gerar CNPJs aleatórios</h2>
+      <p class="subtitulo">Cada CNPJ é usado uma única vez entre buscas e gerações.</p>
+      <form method="post" action="/gerar">
+        <label for="quantidade">Quantidade</label>
+        <select id="quantidade" name="quantidade">
+          <option value="10">10 empresas</option>
+          <option value="50">50 empresas</option>
+          <option value="100">100 empresas</option>
+          <option value="250">250 empresas</option>
+          <option value="500">500 empresas</option>
+        </select>
+        <label for="ddd_gerar">DDD (opcional, vazio = todos)</label>
+        <input id="ddd_gerar" name="ddd" type="text" inputmode="numeric"
+               maxlength="3" placeholder="Ex.: 11">
+        <button type="submit">Gerar empresas</button>
+      </form>
+    </div>
+  </section>
 
-<nav class="links">
-  <a href="/">Início</a>
-  <a href="/historico">Histórico de CNPJs utilizados</a>
-  {sair_html}
-</nav>
+  <nav class="links">
+    <a href="/">Início</a>
+    <a href="/historico">Histórico de CNPJs utilizados</a>
+    {sair_html}
+  </nav>
 
-<section class="resultados">
-  <h2>{escapar(titulo)}</h2>
-  {conteudo}
-</section>
+  <section class="resultados">
+    <h2>{escapar(titulo)}</h2>
+    {conteudo}
+  </section>
 
-<p class="rodape">
-  Uso local para estudo e testes. Os dados empresariais devem ser tratados
-  conforme a legislação aplicável. A busca registra os resultados apresentados.
-</p>
+  <p class="rodape">
+    Uso local para estudo e testes. Os dados empresariais devem ser tratados
+    conforme a legislação aplicável. A busca registra os resultados apresentados.
+  </p>
 </main>
 </body>
 </html>"""
@@ -532,7 +629,6 @@ class CNPJHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         self.usuario = self.usuario_logado()
-
         try:
             # ---- rotas públicas
             if url.path == "/login":
@@ -541,14 +637,12 @@ class CNPJHandler(BaseHTTPRequestHandler):
                 return self.responder(200, pagina_auth(
                     "Login", "/login",
                     link='Não tem conta? <a href="/cadastro">Cadastre-se</a>'))
-
             if url.path == "/cadastro":
                 if self.usuario:
                     return self.redirecionar("/")
                 return self.responder(200, pagina_auth(
                     "Cadastro", "/cadastro",
                     link='Já tem conta? <a href="/login">Entrar</a>'))
-
             if url.path == "/logout":
                 return self.redirecionar("/login", self.cookie_logout())
 
@@ -565,9 +659,15 @@ class CNPJHandler(BaseHTTPRequestHandler):
             elif url.path == "/buscar":
                 parametros = parse_qs(url.query)
                 termo = parametros.get("q", [""])[0][:120]
-                resultados = buscar_empresas(termo)
+                ddd = normalizar_ddd(parametros.get("ddd", [""])[0][:5])
+                resultados = buscar_empresas(termo, ddd)
+                filtros_txt = []
+                if termo:
+                    filtros_txt.append(f"termo: <strong>{escapar(termo)}</strong>")
+                if ddd:
+                    filtros_txt.append(f"DDD: <strong>{escapar(ddd)}</strong>")
                 conteudo = (
-                    f"<p>Termo pesquisado: <strong>{escapar(termo)}</strong>. "
+                    f"<p>Filtros: {' | '.join(filtros_txt) or 'nenhum'}. "
                     f"Resultados exibidos e registrados: {len(resultados)}.</p>"
                     + tabela_empresas(resultados)
                 )
@@ -576,8 +676,11 @@ class CNPJHandler(BaseHTTPRequestHandler):
             elif url.path == "/historico":
                 con = conectar()
                 try:
-                    historico = con.execute("""
-                        SELECT e.cnpj, e.nome, e.telefone, g.data_geracao
+                    renda, porte = campos_extras(con)
+                    historico = con.execute(f"""
+                        SELECT e.cnpj, e.nome, e.telefone,
+                               {renda} AS renda, {porte} AS porte,
+                               g.cnpj AS cnpj_usado, g.data_geracao
                         FROM empresas_geradas g
                         LEFT JOIN empresas e ON e.cnpj = g.cnpj
                         ORDER BY g.data_geracao DESC, g.cnpj
@@ -590,34 +693,35 @@ class CNPJHandler(BaseHTTPRequestHandler):
                     linhas = []
                     for item in historico:
                         linhas.append(f"""
-                            <tr>
-                              <td>{escapar(item['cnpj'])}</td>
-                              <td>{escapar(item['nome'])}</td>
-                              <td>{escapar(item['telefone'])}</td>
-                              <td>{escapar(item['data_geracao'])}</td>
-                            </tr>
+                        <tr>
+                            <td>{escapar(item['cnpj'] or item['cnpj_usado'])}</td>
+                            <td>{escapar(item['nome'])}</td>
+                            <td>{escapar(item['telefone'])}</td>
+                            <td>{escapar(extrair_ddd(item['telefone']) or '—')}</td>
+                            <td>{escapar(formatar_renda(item['renda']))}</td>
+                            <td>{escapar(item['porte'] or '—')}</td>
+                            <td>{escapar(item['data_geracao'])}</td>
+                        </tr>
                         """)
                     conteudo = f"""
                     <div class="tabela-wrap"><table>
                     <thead><tr><th>CNPJ</th><th>Nome fantasia</th>
-                    <th>Telefone</th><th>Data de utilização</th></tr></thead>
+                    <th>Telefone</th><th>DDD</th><th>Renda</th><th>Porte</th>
+                    <th>Data de utilização</th></tr></thead>
                     <tbody>{''.join(linhas)}</tbody></table></div>
                     """
                 else:
                     conteudo = "<p>Nenhum CNPJ utilizado ainda.</p>"
-
                 self.render(200, conteudo, "Histórico de CNPJs utilizados")
 
             else:
                 self.render(404, "<p>Página não encontrada.</p>", "Erro 404")
-
         except sqlite3.Error as erro:
             self.render(500, f"<p>Erro no banco de dados: {escapar(erro)}</p>", "Erro")
 
     def do_POST(self):
         url = urlparse(self.path)
         self.usuario = self.usuario_logado()
-
         try:
             # ---- rotas públicas
             if url.path == "/login":
@@ -629,7 +733,6 @@ class CNPJHandler(BaseHTTPRequestHandler):
                 return self.responder(200, pagina_auth(
                     "Login", "/login", "E-mail ou senha incorretos.",
                     '<a href="/cadastro">Criar conta</a>'))
-
             if url.path == "/cadastro":
                 form = self.ler_form()
                 email = form.get("email", [""])[0].strip().lower()
@@ -658,21 +761,21 @@ class CNPJHandler(BaseHTTPRequestHandler):
 
             parametros = self.ler_form()
             quantidade_texto = parametros.get("quantidade", ["10"])[0]
-
             try:
                 quantidade = int(quantidade_texto)
             except ValueError:
                 quantidade = 10
-
             quantidade = max(1, min(quantidade, MAX_GERACAO))
-            resultados = gerar_empresas(quantidade)
+            ddd = normalizar_ddd(parametros.get("ddd", [""])[0][:5])
+
+            resultados = gerar_empresas(quantidade, ddd)
+            ddd_txt = f" (DDD {escapar(ddd)})" if ddd else ""
             conteudo = (
-                f"<p>Solicitadas: {quantidade}. Empresas encontradas e registradas: "
-                f"{len(resultados)}.</p>"
+                f"<p>Solicitadas: {quantidade}{ddd_txt}. "
+                f"Empresas encontradas e registradas: {len(resultados)}.</p>"
                 + tabela_empresas(resultados)
             )
             self.render(200, conteudo, "Empresas geradas")
-
         except (ValueError, UnicodeError) as erro:
             self.render(400, f"<p>Dados inválidos: {escapar(erro)}</p>", "Erro")
         except sqlite3.Error as erro:
